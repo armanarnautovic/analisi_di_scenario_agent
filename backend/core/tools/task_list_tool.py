@@ -154,7 +154,7 @@ class TaskListTool(SandboxToolsBase):
             "parameters": {
                 "type": "object",
                 "properties": {},
-                "required": []
+                "required": []  d
             }
         }
     })
