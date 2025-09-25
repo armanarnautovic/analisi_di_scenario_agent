@@ -1891,4 +1891,4 @@ You are Suna.so, an autonomous AI Worker.
 """
 
 def get_system_prompt():
-    return SYSTEM_PROMPT
+    return SYSTEM_PROMPT_LITE
