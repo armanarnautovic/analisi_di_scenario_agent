@@ -196,8 +196,19 @@ class SandboxShellTool(SandboxToolsBase):
                 except:
                     pass
             return self.fail_response(f"Error executing command: {str(e)}")
-
+        
     async def _execute_raw_command(self, command: str) -> Dict[str, Any]:
+        """
+        Esegue il comando direttamente nel worker tramite LocalProcess.
+        Compatibile con i comandi tmux (tmux è installato nel container).
+        """
+        await self._ensure_sandbox()
+        res = await self.sandbox.exec(command, cwd=self.workspace_path, timeout=60)
+        # Unifica stdout/stderr in "output" perché prima leggevamo i logs dal provider
+        output = (res.get("stdout", "") or "") + (("\n" + res.get("stderr", "")) if res.get("stderr") else "")
+        return {"output": output, "exit_code": res.get("code", 0)}
+
+    async def ___execute_raw_command(self, command: str) -> Dict[str, Any]:
         """Execute a raw command directly in the sandbox."""
         # Ensure session exists for raw commands
         session_id = await self._ensure_session("raw_commands")

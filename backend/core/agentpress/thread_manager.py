@@ -324,6 +324,8 @@ class ThreadManager:
                 prepared_messages = validate_cache_blocks(prepared_messages, llm_model)
             else:
                 prepared_messages = [system_prompt] + messages
+                
+            prepared_messages += prepared_messages + [{"role": "user", "content": """ CRUCIAL: When you have achieved your final goal, say "JOB FINISHED YUH!". Do noy say it for any reason until you have achieved your final goal. It's your prohibited word unless you have achieved your final goal. """}]
 
             # Get tool schemas if needed
             openapi_tool_schemas = self.tool_registry.get_openapi_schemas() if config.native_tool_calling else None

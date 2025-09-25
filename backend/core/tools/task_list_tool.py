@@ -183,7 +183,11 @@ class TaskListTool(SandboxToolsBase):
         "type": "function",
         "function": {
             "name": "create_tasks",
-            "description": "Create tasks organized by sections. Supports both single section and multi-section batch creation. Creates sections automatically if they don't exist. IMPORTANT: Create tasks in the exact order they will be executed. Each task should represent a single, specific operation that can be completed independently. Break down complex operations into individual, sequential tasks to maintain the one-task-at-a-time execution principle. You MUST specify either 'sections' array OR both 'task_contents' and ('section_title' OR 'section_id').",
+            "description": (
+                "Create tasks organized by sections. You MUST pass either the 'sections' array "
+                "OR pass 'task_contents' together with EXACTLY ONE of 'section_title' or 'section_id'. "
+                "Order tasks exactly as they must be executed (single, atomic steps)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -205,32 +209,28 @@ class TaskListTool(SandboxToolsBase):
                                 }
                             },
                             "required": ["title", "tasks"]
-                        }
+                        },
+                        "minItems": 1
                     },
                     "section_title": {
                         "type": "string",
-                        "description": "Single section title (creates if doesn't exist - use this OR sections array)"
+                        "description": "Single section title (creates if doesn't exist)"
                     },
                     "section_id": {
                         "type": "string",
-                        "description": "Existing section ID (use this OR sections array OR section_title)"
+                        "description": "Existing section ID"
                     },
                     "task_contents": {
                         "type": "array",
-                        "description": "Task contents for single section creation (use with section_title or section_id)",
-                        "items": {"type": "string"}
+                        "description": "Task contents for single section creation",
+                        "items": {"type": "string"},
+                        "minItems": 1
                     }
                 },
-                "anyOf": [
-                    {"required": ["sections"]},
-                    {
-                        "required": ["task_contents"],
-                        "anyOf": [
-                            {"required": ["section_title"]},
-                            {"required": ["section_id"]}
-                        ]
-                    }
-                ]
+                "additionalProperties": False
+                # ⚠️ NIENTE anyOf/oneOf/allOf al top-level
+                # La regola “o sections, o task_contents + (section_title|section_id)”
+                # la facciamo nel codice Python sotto.
             }
         }
     })
@@ -449,28 +449,25 @@ class TaskListTool(SandboxToolsBase):
                 "type": "object",
                 "properties": {
                     "task_ids": {
-                        "oneOf": [
-                            {"type": "string"},
-                            {"type": "array", "items": {"type": "string"}, "minItems": 1}
-                        ],
-                        "description": "Task ID (string) or array of task IDs to delete (optional)"
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "description": "Array of task IDs to delete. (Nota: il tool accetta anche una singola stringa e la normalizza internamente.)"
                     },
                     "section_ids": {
-                        "oneOf": [
-                            {"type": "string"},
-                            {"type": "array", "items": {"type": "string"}, "minItems": 1}
-                        ],
-                        "description": "Section ID (string) or array of section IDs to delete (will also delete all tasks in these sections) (optional)"
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "description": "Array of section IDs to delete (will also delete all tasks in these sections). (Nota: il tool accetta anche una singola stringa e la normalizza internamente.)"
                     },
                     "confirm": {
                         "type": "boolean",
-                        "description": "Must be true to confirm deletion of sections (required when deleting sections)"
+                        "description": "Must be true to confirm deletion of sections"
                     }
                 },
-                "anyOf": [
-                    {"required": ["task_ids"]},
-                    {"required": ["section_ids", "confirm"]}
-                ]
+                # Nessun anyOf/oneOf: la validazione avviene a runtime.
+                "additionalProperties": False
+                
             }
         }
     })

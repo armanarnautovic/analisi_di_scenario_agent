@@ -2,11 +2,20 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - redis_data:/data
-      - ./backend/services/docker/redis.conf:/usr/local/etc/redis/redis.conf:ro
-    command: redis-server /usr/local/etc/redis/redis.conf --save 60 1 --loglevel warning
+      - ./backend/core/services/docker/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: >
+      redis-server /usr/local/etc/redis/redis.conf
+      --appendonly yes
+      --save 60 1
+      --loglevel warning
+      --timeout 0                 
+      --tcp-keepalive 300         
+      --client-output-buffer-limit pubsub 0 0 0  
+      --maxmemory 256mb           
+      --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -23,6 +32,7 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/.env:/app/.env
+      - workspace:/workspace
     env_file:
       - ./backend/.env
     environment:
@@ -45,6 +55,7 @@ services:
     command: uv run dramatiq --skip-logging --processes 4 --threads 4 run_agent_background
     volumes:
       - ./backend/.env:/app/.env:ro
+      - workspace:/workspace
     env_file:
       - ./backend/.env
     environment:
@@ -52,6 +63,9 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=
       - REDIS_SSL=False
+      - SANDBOX_PROVIDER=local_process
+      - SANDBOX_WORKSPACE_ROOT=/workspace
+      - SANDBOX_EXEC_TIMEOUT_SEC=900
     depends_on:
       redis:
         condition: service_healthy
@@ -70,3 +84,4 @@ services:
 
 volumes:
   redis_data:
+  workspace: {}

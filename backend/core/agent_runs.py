@@ -15,6 +15,7 @@ from core.billing.billing_integration import billing_integration
 from core.utils.config import config, EnvMode
 from core.services import redis
 from core.sandbox.sandbox import create_sandbox, delete_sandbox
+from core.sandbox.workspace_config import workspace_config
 from run_agent_background import run_agent_background
 from core.ai_models import model_manager
 
@@ -198,17 +199,17 @@ async def start_agent(
             raise HTTPException(status_code=500, detail={"message": error_message})
     
     # Check agent run limits (only if not in local mode)
-    if config.ENV_MODE != EnvMode.LOCAL:
-        limit_check = await check_agent_run_limit(client, account_id)
-        if not limit_check['can_start']:
-            error_detail = {
-                "message": f"Maximum of {config.MAX_PARALLEL_AGENT_RUNS} parallel agent runs allowed within 24 hours. You currently have {limit_check['running_count']} running.",
-                "running_thread_ids": limit_check['running_thread_ids'],
-                "running_count": limit_check['running_count'],
-                "limit": config.MAX_PARALLEL_AGENT_RUNS
-            }
-            logger.warning(f"Agent run limit exceeded for account {account_id}: {limit_check['running_count']} running agents")
-            raise HTTPException(status_code=429, detail=error_detail)
+    #if config.ENV_MODE != EnvMode.LOCAL:
+    #    limit_check = await check_agent_run_limit(client, account_id)
+    #    if not limit_check['can_start']:
+    #        error_detail = {
+    #            "message": f"Maximum of {config.MAX_PARALLEL_AGENT_RUNS} parallel agent runs allowed within 24 hours. You currently have {limit_check['running_count']} running.",
+    #            "running_thread_ids": limit_check['running_thread_ids'],
+    #            "running_count": limit_check['running_count'],
+    #            "limit": config.MAX_PARALLEL_AGENT_RUNS
+    #        }
+    #        logger.warning(f"Agent run limit exceeded for account {account_id}: {limit_check['running_count']} running agents")
+    #        raise HTTPException(status_code=429, detail=error_detail)
 
     effective_model = model_name
     if not model_name and agent_config and agent_config.get('model'):
@@ -247,6 +248,7 @@ async def start_agent(
         logger.warning(f"Failed to register agent run in Redis ({instance_key}): {str(e)}")
 
     request_id = structlog.contextvars.get_contextvars().get('request_id')
+    
 
     run_agent_background.send(
         agent_run_id=agent_run_id, thread_id=thread_id, instance_id=utils.instance_id,
@@ -254,7 +256,7 @@ async def start_agent(
         model_name=model_name,  # Already resolved above
         enable_thinking=body.enable_thinking, reasoning_effort=body.reasoning_effort,
         stream=body.stream, enable_context_manager=body.enable_context_manager,
-        enable_prompt_caching=body.enable_prompt_caching,
+        enable_prompt_caching=True,
         agent_config=agent_config,  # Pass agent configuration
         request_id=request_id,
     )
@@ -474,154 +476,175 @@ async def stream_agent_run(
     async def stream_generator(agent_run_data):
         logger.debug(f"Streaming responses for {agent_run_id} using Redis list {response_list_key} and channel {response_channel}")
         last_processed_index = -1
-        # Single pubsub used for response + control
-        listener_task = None
         terminate_stream = False
         initial_yield_complete = False
 
-        try:
-            # 1. Fetch and yield initial responses from Redis list
-            initial_responses_json = await redis.lrange(response_list_key, 0, -1)
-            initial_responses = []
-            if initial_responses_json:
-                initial_responses = [json.loads(r) for r in initial_responses_json]
-                logger.debug(f"Sending {len(initial_responses)} initial responses for {agent_run_id}")
-                for response in initial_responses:
-                    yield f"data: {json.dumps(response)}\n\n"
-                last_processed_index = len(initial_responses) - 1
-            initial_yield_complete = True
-
-            # 2. Check run status
-            current_status = agent_run_data.get('status') if agent_run_data else None
-
-            if current_status != 'running':
-                logger.debug(f"Agent run {agent_run_id} is not running (status: {current_status}). Ending stream.")
-                yield f"data: {json.dumps({'type': 'status', 'status': 'completed'})}\n\n"
-                return
-          
-            structlog.contextvars.bind_contextvars(
-                thread_id=agent_run_data.get('thread_id'),
-            )
-
-            # 3. Use a single Pub/Sub connection subscribed to both channels
-            pubsub = await redis.create_pubsub()
-            await pubsub.subscribe(response_channel, control_channel)
-            logger.debug(f"Subscribed to channels: {response_channel}, {control_channel}")
-
-            # Queue to communicate between listeners and the main generator loop
-            message_queue = asyncio.Queue()
-
-            async def listen_messages():
-                listener = pubsub.listen()
-                task = asyncio.create_task(listener.__anext__())
-
-                while not terminate_stream:
-                    done, _ = await asyncio.wait([task], return_when=asyncio.FIRST_COMPLETED)
-                    for finished in done:
+        async def _yield_initial():
+            nonlocal last_processed_index, initial_yield_complete
+            try:
+                initial_responses_json = await redis.lrange(response_list_key, 0, -1)
+                if initial_responses_json:
+                    for r in initial_responses_json:
                         try:
-                            message = finished.result()
-                            if message and isinstance(message, dict) and message.get("type") == "message":
-                                channel = message.get("channel")
-                                data = message.get("data")
-                                if isinstance(data, bytes):
-                                    data = data.decode('utf-8')
+                            payload = json.loads(r)
+                        except Exception:
+                            payload = {"type": "text", "content": str(r)}
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    last_processed_index = len(initial_responses_json) - 1
+                initial_yield_complete = True
+            except Exception as e:
+                logger.error(f"Initial fetch from Redis list failed: {e}", exc_info=True)
+                # consentiamo comunque allo stream di proseguire
 
-                                if channel == response_channel and data == "new":
-                                    await message_queue.put({"type": "new_response"})
-                                elif channel == control_channel and data in ["STOP", "END_STREAM", "ERROR"]:
-                                    logger.debug(f"Received control signal '{data}' for {agent_run_id}")
-                                    await message_queue.put({"type": "control", "data": data})
-                                    return  # Stop listening on control signal
+        async def _yield_new_from_list():
+            """Legge dal Redis List gli elementi successivi all'ultimo indicizzato."""
+            nonlocal last_processed_index, terminate_stream
+            start = last_processed_index + 1
+            new_responses_json = await redis.lrange(response_list_key, start, -1)
+            if not new_responses_json:
+                return
+            for r in new_responses_json:
+                try:
+                    payload = json.loads(r)
+                except Exception:
+                    payload = {"type": "text", "content": str(r)}
+                await asyncio.sleep(0)  # cedo il loop in caso di burst
+                yield f"data: {json.dumps(payload)}\n\n"
+                # Se payload segnala termine, chiudi gentilmente
+                if payload.get("type") == "status" and payload.get("status") in {"completed", "failed", "stopped"}:
+                    logger.debug(f"Detected run completion via status message in stream: {payload.get('status')}")
+                    terminate_stream = True
+                    break
+            # aggiorna indice dopo flush completo
+            last_processed_index += len(new_responses_json)
 
-                        except StopAsyncIteration:
-                            logger.warning(f"Listener stopped for {agent_run_id}.")
-                            await message_queue.put({"type": "error", "data": "Listener stopped unexpectedly"})
-                            return
-                        except Exception as e:
-                            logger.error(f"Error in listener for {agent_run_id}: {e}")
-                            await message_queue.put({"type": "error", "data": "Listener failed"})
-                            return
-                        finally:
-                            # Resubscribe to the next message if continuing
-                            if not terminate_stream:
-                                task = asyncio.create_task(listener.__anext__())
+        async def _keepalive_task(pubsub):
+            """PING periodico per tenere viva la connessione."""
+            try:
+                while not terminate_stream:
+                    await asyncio.sleep(25)
+                    try:
+                        await pubsub.ping()
+                    except Exception as e:
+                        logger.debug(f"PubSub keepalive ping failed (will reconnect in main loop): {e}")
+                        return
+            except asyncio.CancelledError:
+                return
 
+        # 1) yield iniziale
+        async for chunk in _yield_initial():
+            yield chunk
 
-            listener_task = asyncio.create_task(listen_messages())
+        # 2) Se il run non è running, chiudi subito
+        current_status = agent_run_data.get('status') if agent_run_data else None
+        if current_status != 'running':
+            yield f"data: {json.dumps({'type': 'status', 'status': 'completed'})}\n\n"
+            return
 
-            # 4. Main loop to process messages from the queue
+        # 3) main loop con pubsub polling + riconnessioni
+        pubsub = None
+        keepalive = None
+
+        try:
             while not terminate_stream:
                 try:
-                    queue_item = await message_queue.get()
+                    # (re)create pubsub e subscribe
+                    if pubsub is None:
+                        pubsub = await redis.create_pubsub()
+                        await pubsub.subscribe(response_channel, control_channel)
+                        logger.debug(f"Subscribed to channels: {response_channel}, {control_channel}")
+                        # (ri)invio tutto ciò che fosse arrivato nel frattempo sulla lista
+                        async for chunk in _yield_new_from_list():
+                            yield chunk
+                        # avvia keepalive
+                        if keepalive is None or keepalive.done():
+                            keepalive = asyncio.create_task(_keepalive_task(pubsub))
 
-                    if queue_item["type"] == "new_response":
-                        # Fetch new responses from Redis list starting after the last processed index
-                        new_start_index = last_processed_index + 1
-                        new_responses_json = await redis.lrange(response_list_key, new_start_index, -1)
+                    # poll non bloccante del pubsub
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if message:
+                        channel = message.get("channel")
+                        data = message.get("data")
+                        if isinstance(data, bytes):
+                            try:
+                                data = data.decode("utf-8")
+                            except Exception:
+                                data = str(data)
 
-                        if new_responses_json:
-                            new_responses = [json.loads(r) for r in new_responses_json]
-                            num_new = len(new_responses)
-                            # logger.debug(f"Received {num_new} new responses for {agent_run_id} (index {new_start_index} onwards)")
-                            for response in new_responses:
-                                yield f"data: {json.dumps(response)}\n\n"
-                                # Check if this response signals completion
-                                if response.get('type') == 'status' and response.get('status') in ['completed', 'failed', 'stopped']:
-                                    logger.debug(f"Detected run completion via status message in stream: {response.get('status')}")
-                                    terminate_stream = True
-                                    break # Stop processing further new responses
-                            last_processed_index += num_new
-                        if terminate_stream: break
+                        # Segnale “nuovi chunk in lista”
+                        if channel == response_channel and data == "new":
+                            async for chunk in _yield_new_from_list():
+                                yield chunk
+                            if terminate_stream:
+                                break
 
-                    elif queue_item["type"] == "control":
-                        control_signal = queue_item["data"]
-                        terminate_stream = True # Stop the stream on any control signal
-                        yield f"data: {json.dumps({'type': 'status', 'status': control_signal})}\n\n"
-                        break
+                        # Segnali di controllo
+                        elif channel == control_channel and data in {"STOP", "END_STREAM", "ERROR"}:
+                            logger.debug(f"Received control signal '{data}' for {agent_run_id}")
+                            terminate_stream = True
+                            yield f"data: {json.dumps({'type': 'status', 'status': data})}\n\n"
+                            break
 
-                    elif queue_item["type"] == "error":
-                        logger.error(f"Listener error for {agent_run_id}: {queue_item['data']}")
-                        terminate_stream = True
-                        yield f"data: {json.dumps({'type': 'status', 'status': 'error'})}\n\n"
-                        break
+                    # Se nulla è arrivato, controllo periodicamente la lista
+                    else:
+                        async for chunk in _yield_new_from_list():
+                            yield chunk
+                        if terminate_stream:
+                            break
+
+                except (redis.ConnectionError, redis.TimeoutError, ConnectionError) as e:
+                    # Redis ha chiuso: chiudi risorse e tenta reconnessione con backoff
+                    logger.warning(f"PubSub connection dropped, will reconnect: {e}")
+                    if keepalive and not keepalive.done():
+                        keepalive.cancel()
+                        try:
+                            await keepalive
+                        except Exception:
+                            pass
+                    keepalive = None
+                    try:
+                        if pubsub:
+                            await pubsub.close()
+                    except Exception:
+                        pass
+                    pubsub = None
+                    await asyncio.sleep(1.5)  # backoff breve e riprova
 
                 except asyncio.CancelledError:
-                     logger.debug(f"Stream generator main loop cancelled for {agent_run_id}")
-                     terminate_stream = True
-                     break
-                except Exception as loop_err:
-                    logger.error(f"Error in stream generator main loop for {agent_run_id}: {loop_err}", exc_info=True)
                     terminate_stream = True
-                    yield f"data: {json.dumps({'type': 'status', 'status': 'error', 'message': f'Stream failed: {loop_err}'})}\n\n"
                     break
 
-        except Exception as e:
-            logger.error(f"Error setting up stream for agent run {agent_run_id}: {e}", exc_info=True)
-            # Only yield error if initial yield didn't happen
-            if not initial_yield_complete:
-                 yield f"data: {json.dumps({'type': 'status', 'status': 'error', 'message': f'Failed to start stream: {e}'})}\n\n"
+                except Exception as e:
+                    logger.error(f"Error in stream loop: {e}", exc_info=True)
+                    terminate_stream = True
+                    yield f"data: {json.dumps({'type': 'status', 'status': 'error', 'message': f'Stream failed: {e}'})}\n\n"
+                    break
+
         finally:
             terminate_stream = True
-            # Graceful shutdown order: unsubscribe → close → cancel
+            # cleanup ordinato
             try:
-                if 'pubsub' in locals() and pubsub:
-                    await pubsub.unsubscribe(response_channel, control_channel)
+                if keepalive and not keepalive.done():
+                    keepalive.cancel()
+                    try:
+                        await keepalive
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                if pubsub:
+                    try:
+                        await pubsub.unsubscribe(response_channel, control_channel)
+                    except Exception:
+                        pass
                     await pubsub.close()
-            except Exception as e:
-                logger.debug(f"Error during pubsub cleanup for {agent_run_id}: {e}")
-
-            if listener_task:
-                listener_task.cancel()
-                try:
-                    await listener_task  # Reap inner tasks & swallow their errors
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.debug(f"listener_task ended with: {e}")
-            # Wait briefly for tasks to cancel
-            await asyncio.sleep(0.1)
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
             logger.debug(f"Streaming cleanup complete for agent run: {agent_run_id}")
-
+    
+    
     return StreamingResponse(stream_generator(agent_run_data), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform", "Connection": "keep-alive",
         "X-Accel-Buffering": "no", "Content-Type": "text/event-stream",
@@ -707,6 +730,8 @@ async def initiate_agent_with_files(
         
         agent_config = extract_agent_config(agent_data, version_data)
         
+        logger.debug(f"Agent Config: {agent_config}")
+        
         if version_data:
             logger.debug(f"Using custom agent: {agent_config['name']} ({agent_id}) version {agent_config.get('version_name', 'v1')}")
         else:
@@ -738,6 +763,8 @@ async def initiate_agent_with_files(
             logger.debug(f"[AGENT INITIATE] About to call extract_agent_config for DEFAULT agent with version data: {version_data is not None}")
             
             agent_config = extract_agent_config(agent_data, version_data)
+        
+            logger.debug(f"Agent Config: {agent_config}")
             
             if version_data:
                 logger.debug(f"Using default agent: {agent_config['name']} ({agent_config['agent_id']}) version {agent_config.get('version_name', 'v1')}")
@@ -767,36 +794,36 @@ async def initiate_agent_with_files(
             raise HTTPException(status_code=500, detail={"message": error_message})
     
     # Check additional limits (only if not in local mode)
-    if config.ENV_MODE != EnvMode.LOCAL:
-        # Check agent run limit and project limit concurrently
-        limit_check_task = asyncio.create_task(check_agent_run_limit(client, account_id))
-        project_limit_check_task = asyncio.create_task(check_project_count_limit(client, account_id))
-        
-        limit_check, project_limit_check = await asyncio.gather(
-            limit_check_task, project_limit_check_task
-        )
-        
-        # Check agent run limit (maximum parallel runs in past 24 hours)
-        if not limit_check['can_start']:
-            error_detail = {
-                "message": f"Maximum of {config.MAX_PARALLEL_AGENT_RUNS} parallel agent runs allowed within 24 hours. You currently have {limit_check['running_count']} running.",
-                "running_thread_ids": limit_check['running_thread_ids'],
-                "running_count": limit_check['running_count'],
-                "limit": config.MAX_PARALLEL_AGENT_RUNS
-            }
-            logger.warning(f"Agent run limit exceeded for account {account_id}: {limit_check['running_count']} running agents")
-            raise HTTPException(status_code=429, detail=error_detail)
-
-        if not project_limit_check['can_create']:
-            error_detail = {
-                "message": f"Maximum of {project_limit_check['limit']} projects allowed for your current plan. You have {project_limit_check['current_count']} projects.",
-                "current_count": project_limit_check['current_count'],
-                "limit": project_limit_check['limit'],
-                "tier_name": project_limit_check['tier_name'],
-                "error_code": "PROJECT_LIMIT_EXCEEDED"
-            }
-            logger.warning(f"Project limit exceeded for account {account_id}: {project_limit_check['current_count']}/{project_limit_check['limit']} projects")
-            raise HTTPException(status_code=402, detail=error_detail)
+    #if config.ENV_MODE != EnvMode.LOCAL:
+    #    # Check agent run limit and project limit concurrently
+    #    limit_check_task = asyncio.create_task(check_agent_run_limit(client, account_id))
+    #    project_limit_check_task = asyncio.create_task(check_project_count_limit(client, account_id))
+    #    
+    #    limit_check, project_limit_check = await asyncio.gather(
+    #        limit_check_task, project_limit_check_task
+    #    )
+    #    
+    #    # Check agent run limit (maximum parallel runs in past 24 hours)
+    #    if not limit_check['can_start']:
+    #        error_detail = {
+    #            "message": f"Maximum of {config.MAX_PARALLEL_AGENT_RUNS} parallel agent runs allowed within 24 hours. You currently have {limit_check['running_count']} running.",
+    #            "running_thread_ids": limit_check['running_thread_ids'],
+    #            "running_count": limit_check['running_count'],
+    #            "limit": config.MAX_PARALLEL_AGENT_RUNS
+    #        }
+    #        logger.warning(f"Agent run limit exceeded for account {account_id}: {limit_check['running_count']} running agents")
+    #        raise HTTPException(status_code=429, detail=error_detail)
+#
+    #    if not project_limit_check['can_create']:
+    #        error_detail = {
+    #            "message": f"Maximum of {project_limit_check['limit']} projects allowed for your current plan. You have {project_limit_check['current_count']} projects.",
+    #            "current_count": project_limit_check['current_count'],
+    #            "limit": project_limit_check['limit'],
+    #            "tier_name": project_limit_check['tier_name'],
+    #            "error_code": "PROJECT_LIMIT_EXCEEDED"
+    #        }
+    #        logger.warning(f"Project limit exceeded for account {account_id}: {project_limit_check['current_count']}/{project_limit_check['limit']} projects")
+    #        raise HTTPException(status_code=402, detail=error_detail)
 
     try:
         # 1. Create Project
@@ -898,7 +925,8 @@ async def initiate_agent_with_files(
                 if file.filename:
                     try:
                         safe_filename = file.filename.replace('/', '_').replace('\\', '_')
-                        target_path = f"/workspace/{safe_filename}"
+                        # Use centralized workspace configuration for file upload path
+                        target_path = workspace_config.get_file_upload_path(project_id, safe_filename)
                         logger.debug(f"Attempting to upload {safe_filename} to {target_path} in sandbox {sandbox_id}")
                         content = await file.read()
                         upload_successful = False
@@ -988,6 +1016,8 @@ async def initiate_agent_with_files(
             logger.warning(f"Failed to register agent run in Redis ({instance_key}): {str(e)}")
 
         request_id = structlog.contextvars.get_contextvars().get('request_id')
+        
+        logger.debug(f"DIO PORCO: {agent_run_id}")
 
         # Run agent in background
         run_agent_background.send(

@@ -74,6 +74,8 @@ async def run_agent_background(
         thread_id=thread_id,
         request_id=request_id,
     )
+    
+    logger.debug(f"Agent Config: {agent_config}")
 
     try:
         await initialize()
@@ -103,7 +105,7 @@ async def run_agent_background(
     sentry.sentry.set_tag("thread_id", thread_id)
 
     logger.info(f"Starting background agent run: {agent_run_id} for thread: {thread_id} (Instance: {instance_id})")
-    
+        
     from core.ai_models import model_manager
 
     effective_model = model_manager.resolve_model_id(model_name)
@@ -125,10 +127,11 @@ async def run_agent_background(
     instance_active_key = f"active_run:{instance_id}:{agent_run_id}"
 
     async def check_for_stop_signal():
-        nonlocal stop_signal_received
+        nonlocal stop_signal_received, pubsub
         if not pubsub: return
-        try:
-            while not stop_signal_received:
+        
+        while not stop_signal_received:
+            try:
                 message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
                 if message and message.get("type") == "message":
                     data = message.get("data")
@@ -142,11 +145,31 @@ async def run_agent_background(
                     try: await redis.expire(instance_active_key, redis.REDIS_KEY_TTL)
                     except Exception as ttl_err: logger.warning(f"Failed to refresh TTL for {instance_active_key}: {ttl_err}")
                 await asyncio.sleep(0.1) # Short sleep to prevent tight loop
-        except asyncio.CancelledError:
-            logger.debug(f"Stop signal checker cancelled for {agent_run_id} (Instance: {instance_id})")
-        except Exception as e:
-            logger.error(f"Error in stop signal checker for {agent_run_id}: {e}", exc_info=True)
-            stop_signal_received = True # Stop the run if the checker fails
+                
+            except asyncio.CancelledError:
+                logger.debug(f"Stop signal checker cancelled for {agent_run_id} (Instance: {instance_id})")
+                break
+            except Exception as e:
+                # Handle Redis connection errors with retry logic
+                if "Connection closed by server" in str(e) or "ConnectionError" in str(type(e).__name__):
+                    logger.warning(f"Redis connection lost for {agent_run_id}, attempting to reconnect: {e}")
+                    try:
+                        # Recreate pub/sub connection
+                        if pubsub:
+                            await pubsub.unsubscribe()
+                            await pubsub.close()
+                        pubsub = await redis.create_pubsub()
+                        await retry(lambda: pubsub.subscribe(instance_control_channel, global_control_channel))
+                        logger.info(f"Successfully reconnected to Redis pub/sub for {agent_run_id}")
+                        await asyncio.sleep(1.0)  # Brief pause before continuing
+                        continue
+                    except Exception as reconnect_error:
+                        logger.error(f"Failed to reconnect Redis pub/sub for {agent_run_id}: {reconnect_error}")
+                        await asyncio.sleep(5.0)  # Longer pause before retry
+                        continue
+                else:
+                    logger.error(f"Error in stop signal checker for {agent_run_id}: {e}", exc_info=True)
+                    stop_signal_received = True # Stop the run if the checker fails permanently
 
     trace = langfuse.trace(name="agent_run", id=agent_run_id, session_id=thread_id, metadata={"project_id": project_id, "instance_id": instance_id})
 

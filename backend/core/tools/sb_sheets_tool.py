@@ -78,7 +78,16 @@ class SandboxSheetsTool(SandboxToolsBase):
         if not openpyxl:
             raise RuntimeError("openpyxl not available; cannot read XLSX")
         wb = openpyxl.load_workbook(BytesIO(data), data_only=False)
-        ws = wb[sheet_name] if sheet_name else wb.active
+
+        # fallback robusto
+        if not sheet_name:
+            sheet_name = wb.sheetnames[0] if wb.sheetnames else None
+        if not sheet_name or sheet_name not in wb.sheetnames:
+            raise ValueError(
+                f"Sheet '{sheet_name}' not found. Available sheets: {', '.join(wb.sheetnames)}"
+            )
+
+        ws = wb[sheet_name]
         rows = [list(row) for row in ws.iter_rows(values_only=True)]
         if not rows:
             return SheetData(headers=[], rows=[])
@@ -457,10 +466,32 @@ class SandboxSheetsTool(SandboxToolsBase):
         </invoke>
         </function_calls>
     ''')
-    async def view_sheet(self, file_path: str, sheet_name: Optional[str] = None, max_rows: int = 100, export_csv_path: Optional[str] = None) -> ToolResult:
+    async def view_sheet(self, file_path: str, sheet_name: Optional[str] = None,
+                     max_rows: int = 100, export_csv_path: Optional[str] = None) -> ToolResult:
         try:
             await self._ensure_sandbox()
-            full_path, sheet = await self._load_sheet(file_path, sheet_name)
+            full_path = f"{self.workspace_path}/{self.clean_path(file_path)}"
+            data = await self._download_bytes(full_path)
+
+            if file_path.lower().endswith(".xlsx"):
+                wb = openpyxl.load_workbook(BytesIO(data), data_only=False)
+                sheets = wb.sheetnames
+                if not sheet_name:
+                    sheet_name = sheets[0] if sheets else None
+                if not sheet_name or sheet_name not in sheets:
+                    return self.fail_response(
+                        f"Sheet '{sheet_name}' not found. Available sheets: {', '.join(sheets)}"
+                    )
+                ws = wb[sheet_name]
+                rows = [list(r) for r in ws.iter_rows(values_only=True)]
+                sheet = SheetData(
+                    headers=[str(h) if h else "" for h in rows[0]] if rows else [],
+                    rows=[list(r) for r in rows[1:]] if len(rows) > 1 else []
+                )
+            else:
+                _, sheet = await self._load_sheet(file_path, sheet_name)
+                sheets = None
+
             exported_to = None
             if export_csv_path:
                 rel = self.clean_path(export_csv_path)
@@ -469,13 +500,16 @@ class SandboxSheetsTool(SandboxToolsBase):
                 export_full = f"{self.workspace_path}/{rel}"
                 await self._upload_bytes(export_full, self._write_csv_bytes(sheet))
                 exported_to = export_full
+
             sample_rows = sheet.rows[: max(0, max_rows)]
             return self.success_response({
                 "file_path": full_path,
                 "headers": sheet.headers,
                 "row_count": len(sheet.rows),
                 "sample_rows": sample_rows,
-                "exported_csv": exported_to
+                "exported_csv": exported_to,
+                "available_sheets": sheets,   # utile al modello
+                "used_sheet": sheet_name,
             })
         except Exception as e:
             logger.exception("view_sheet failed")

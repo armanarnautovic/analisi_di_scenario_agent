@@ -13,12 +13,13 @@ class SandboxDeployTool(SandboxToolsBase):
 
     def __init__(self, project_id: str, thread_manager: ThreadManager):
         super().__init__(project_id, thread_manager)
-        self.workspace_path = "/workspace"  # Ensure we're always operating in /workspace
+        # workspace_path is now set by parent class using centralized configuration
         self.cloudflare_api_token = os.getenv("CLOUDFLARE_API_TOKEN")
 
     def clean_path(self, path: str) -> str:
-        """Clean and normalize a path to be relative to /workspace"""
-        return clean_path(path, self.workspace_path)
+        """Clean and normalize a path to be relative to project workspace"""
+        # Use parent class method that leverages centralized workspace configuration
+        return super().clean_path(path)
 
     @openapi_schema({
         "type": "function",

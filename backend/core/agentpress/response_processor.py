@@ -386,6 +386,7 @@ class ResponseProcessor:
                         else:
                             # logger.debug("XML tool call limit reached - not yielding more content chunks")
                             self.trace.event(name="xml_tool_call_limit_reached", level="DEFAULT", status_message=(f"XML tool call limit reached - not yielding more content chunks"))
+                            self.trace.event(name="xml_tool_call_limit_reached", level="DEFAULT", status_message=(f"DIO CANE"))
 
                         # --- Process XML Tool Calls (if enabled and limit not reached) ---
                         if config.xml_tool_calling and not (config.max_xml_tool_calls > 0 and xml_tool_call_count >= config.max_xml_tool_calls):

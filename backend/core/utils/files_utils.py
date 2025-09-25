@@ -73,13 +73,16 @@ def clean_path(path: str, workspace_path: str = "/workspace") -> str:
         
     Returns:
         The cleaned path, relative to the workspace
+        
+    Note: This function is deprecated. Use workspace_config.normalize_path() for new code.
     """
     # Remove any leading slash
     path = path.lstrip('/')
     
     # Remove workspace prefix if present
-    if path.startswith(workspace_path.lstrip('/')):
-        path = path[len(workspace_path.lstrip('/')):]
+    workspace_clean = workspace_path.lstrip('/')
+    if path.startswith(workspace_clean):
+        path = path[len(workspace_clean):]
     
     # Remove workspace/ prefix if present
     if path.startswith('workspace/'):

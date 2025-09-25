@@ -17,15 +17,27 @@ class SandboxFilesTool(SandboxToolsBase):
     def __init__(self, project_id: str, thread_manager: ThreadManager):
         super().__init__(project_id, thread_manager)
         self.SNIPPET_LINES = 4  # Number of context lines to show around edits
-        self.workspace_path = "/workspace"  # Ensure we're always operating in /workspace
+        # workspace_path is now set by parent class using centralized configuration
 
     def clean_path(self, path: str) -> str:
-        """Clean and normalize a path to be relative to /workspace"""
-        return clean_path(path, self.workspace_path)
+        """Clean and normalize a path to be relative to project workspace"""
+        # Use parent class method that leverages centralized workspace configuration
+        return super().clean_path(path)
 
     def _should_exclude_file(self, rel_path: str) -> bool:
-        """Check if a file should be excluded based on path, name, or extension"""
-        return should_exclude_file(rel_path)
+        if should_exclude_file(rel_path):
+            return True
+
+        # Filtri extra per rumore locale
+        rel = rel_path.lstrip("/")
+        noisy_prefixes = (
+            ".venvs/",
+            "node_modules/",
+            ".git/",
+            "__pycache__/",
+            ".cache/",
+        )
+        return rel.startswith(noisy_prefixes)
 
     async def _file_exists(self, path: str) -> bool:
         """Check if a file exists in the sandbox"""
@@ -36,38 +48,38 @@ class SandboxFilesTool(SandboxToolsBase):
             return False
 
     async def get_workspace_state(self) -> dict:
-        """Get the current workspace state by reading all files"""
+        """Ritorna lo stato completo della workspace (ricorsivo)."""
         files_state = {}
         try:
-            # Ensure sandbox is initialized
             await self._ensure_sandbox()
-            
-            files = await self.sandbox.fs.list_files(self.workspace_path)
-            for file_info in files:
-                rel_path = file_info.name
-                
-                # Skip excluded files and directories
-                if self._should_exclude_file(rel_path) or file_info.is_dir:
-                    continue
+            base = self.workspace_path
 
-                try:
-                    full_path = f"{self.workspace_path}/{rel_path}"
-                    content = (await self.sandbox.fs.download_file(full_path)).decode()
-                    files_state[rel_path] = {
-                        "content": content,
-                        "is_dir": file_info.is_dir,
-                        "size": file_info.size,
-                        "modified": file_info.mod_time
-                    }
-                except Exception as e:
-                    print(f"Error reading file {rel_path}: {e}")
-                except UnicodeDecodeError:
-                    print(f"Skipping binary file: {rel_path}")
-
+            import os
+            # 🔽 cammina ricorsivamente sotto la workspace
+            for root, dirs, files in await asyncio.to_thread(os.walk, base):
+                rel_root = root.replace(base.rstrip("/") + "/", "")
+                for fname in files:
+                    rel_path = f"{rel_root}/{fname}" if rel_root else fname
+                    if self._should_exclude_file(rel_path):
+                        continue
+                    full_path = f"{base}/{rel_path}"
+                    try:
+                        content = (await self.sandbox.fs.download_file(full_path)).decode()
+                        info = await self.sandbox.fs.get_file_info(full_path)
+                        files_state[rel_path] = {
+                            "content": content,
+                            "is_dir": False,
+                            "size": info.size,
+                            "modified": info.mod_time,
+                        }
+                    except UnicodeDecodeError:
+                        # binario: lo saltiamo o marchiamo diversamente
+                        pass
+                    except Exception as e:
+                        logger.warning(f"Error reading {rel_path}: {e}")
             return files_state
-        
         except Exception as e:
-            print(f"Error getting workspace state: {str(e)}")
+            logger.error(f"Error getting workspace state: {e}")
             return {}
 
 
@@ -144,7 +156,7 @@ class SandboxFilesTool(SandboxToolsBase):
             message = f"File '{file_path}' created successfully."
             
             # Check if index.html was created and add 8080 server info (only in root workspace)
-            if file_path.lower() == 'index.html':
+            if file_path.lower() == 'index.html' and hasattr(self.sandbox, "get_preview_link"):
                 try:
                     website_link = await self.sandbox.get_preview_link(8080)
                     website_url = website_link.url if hasattr(website_link, 'url') else str(website_link).split("url='")[1].split("'")[0]
@@ -588,104 +600,106 @@ def authenticate_user(username, password):
                 "updated_content": None
             }))
 
-    # @openapi_schema({
-    #     "type": "function",
-    #     "function": {
-    #         "name": "read_file",
-    #         "description": "Read and return the contents of a file. This tool is essential for verifying data, checking file contents, and analyzing information. Always use this tool to read file contents before processing or analyzing data. The file path must be relative to /workspace.",
-    #         "parameters": {
-    #             "type": "object",
-    #             "properties": {
-    #                 "file_path": {
-    #                     "type": "string",
-    #                     "description": "Path to the file to read, relative to /workspace (e.g., 'src/main.py' for /workspace/src/main.py). Must be a valid file path within the workspace."
-    #                 },
-    #                 "start_line": {
-    #                     "type": "integer",
-    #                     "description": "Optional starting line number (1-based). Use this to read specific sections of large files. If not specified, reads from the beginning of the file.",
-    #                     "default": 1
-    #                 },
-    #                 "end_line": {
-    #                     "type": "integer",
-    #                     "description": "Optional ending line number (inclusive). Use this to read specific sections of large files. If not specified, reads to the end of the file.",
-    #                     "default": None
-    #                 }
-    #             },
-    #             "required": ["file_path"]
-    #         }
-    #     }
-    # })
-    # @xml_schema(
-    #     tag_name="read-file",
-    #     mappings=[
-    #         {"param_name": "file_path", "node_type": "attribute", "path": "."},
-    #         {"param_name": "start_line", "node_type": "attribute", "path": ".", "required": False},
-    #         {"param_name": "end_line", "node_type": "attribute", "path": ".", "required": False}
-    #     ],
-    #     example='''
-    #     <!-- Example 1: Read entire file -->
-    #     <read-file file_path="src/main.py">
-    #     </read-file>
-
-    #     <!-- Example 2: Read specific lines (lines 10-20) -->
-    #     <read-file file_path="src/main.py" start_line="10" end_line="20">
-    #     </read-file>
-
-    #     <!-- Example 3: Read from line 5 to end -->
-    #     <read-file file_path="config.json" start_line="5">
-    #     </read-file>
-
-    #     <!-- Example 4: Read last 10 lines -->
-    #     <read-file file_path="logs/app.log" start_line="-10">
-    #     </read-file>
-    #     '''
-    # )
-    # async def read_file(self, file_path: str, start_line: int = 1, end_line: Optional[int] = None) -> ToolResult:
-    #     """Read file content with optional line range specification.
-        
-    #     Args:
-    #         file_path: Path to the file relative to /workspace
-    #         start_line: Starting line number (1-based), defaults to 1
-    #         end_line: Ending line number (inclusive), defaults to None (end of file)
-            
-    #     Returns:
-    #         ToolResult containing:
-    #         - Success: File content and metadata
-    #         - Failure: Error message if file doesn't exist or is binary
-    #     """
-    #     try:
-    #         file_path = self.clean_path(file_path)
-    #         full_path = f"{self.workspace_path}/{file_path}"
-            
-    #         if not await self._file_exists(full_path):
-    #             return self.fail_response(f"File '{file_path}' does not exist")
-            
-    #         # Download and decode file content
-    #         content = await self.sandbox.fs.download_file(full_path).decode()
-            
-    #         # Split content into lines
-    #         lines = content.split('\n')
-    #         total_lines = len(lines)
-            
-    #         # Handle line range if specified
-    #         if start_line > 1 or end_line is not None:
-    #             # Convert to 0-based indices
-    #             start_idx = max(0, start_line - 1)
-    #             end_idx = end_line if end_line is not None else total_lines
-    #             end_idx = min(end_idx, total_lines)  # Ensure we don't exceed file length
-                
-    #             # Extract the requested lines
-    #             content = '\n'.join(lines[start_idx:end_idx])
-            
-    #         return self.success_response({
-    #             "content": content,
-    #             "file_path": file_path,
-    #             "start_line": start_line,
-    #             "end_line": end_line if end_line is not None else total_lines,
-    #             "total_lines": total_lines
-    #         })
-            
-    #     except UnicodeDecodeError:
-    #         return self.fail_response(f"File '{file_path}' appears to be binary and cannot be read as text")
-    #     except Exception as e:
-    #         return self.fail_response(f"Error reading file: {str(e)}")
+    @openapi_schema({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read and return the contents of a file. This tool is essential for verifying data, checking file contents, and analyzing information. Always use this tool to read file contents before processing or analyzing data. The file path must be relative to /workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file to read, relative to /workspace (e.g., 'src/main.py' for /workspace/src/main.py). Must be a valid file path within the workspace."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Optional starting line number (1-based). Use this to read specific sections of large files. If not specified, reads from the beginning of the file.",
+                        "default": 1
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Optional ending line number (inclusive). Use this to read specific sections of large files. If not specified, reads to the end of the file.",
+                        "default": None
+                    }
+                },
+                "required": ["file_path"]
+            }
+        }
+    })
+    
+    #@xml_schema(
+    #    tag_name="read-file",
+    #    mappings=[
+    #        {"param_name": "file_path", "node_type": "attribute", "path": "."},
+    #        {"param_name": "start_line", "node_type": "attribute", "path": ".", "required": False},
+    #        {"param_name": "end_line", "node_type": "attribute", "path": ".", "required": False}
+    #    ],
+    #    example='''
+    #    <!-- Example 1: Read entire file -->
+    #    <read-file file_path="src/main.py">
+    #    </read-file>
+    #
+    #    <!-- Example 2: Read specific lines (lines 10-20) -->
+    #    <read-file file_path="src/main.py" start_line="10" end_line="20">
+    #    </read-file>
+    #
+    #    <!-- Example 3: Read from line 5 to end -->
+    #    <read-file file_path="config.json" start_line="5">
+    #    </read-file>
+    #
+    #    <!-- Example 4: Read last 10 lines -->
+    #    <read-file file_path="logs/app.log" start_line="-10">
+    #    </read-file>
+    #    '''
+    #)
+    
+    async def read_file(self, file_path: str, start_line: int = 1, end_line: Optional[int] = None) -> ToolResult:
+        """Read file content with optional line range specification.
+      
+        Args:
+            file_path: Path to the file relative to /workspace
+            start_line: Starting line number (1-based), defaults to 1
+            end_line: Ending line number (inclusive), defaults to None (end of file)
+          
+        Returns:
+            ToolResult containing:
+            - Success: File content and metadata
+            - Failure: Error message if file doesn't exist or is binary
+        """
+        try:
+            file_path = self.clean_path(file_path)
+            full_path = f"{self.workspace_path}/{file_path}"
+          
+            if not await self._file_exists(full_path):
+                return self.fail_response(f"File '{file_path}' does not exist")
+          
+            # Download and decode file content
+            content = (await self.sandbox.fs.download_file(full_path)).decode()
+          
+            # Split content into lines
+            lines = content.split('\n')
+            total_lines = len(lines)
+          
+            # Handle line range if specified
+            if start_line > 1 or end_line is not None:
+                # Convert to 0-based indices
+                start_idx = max(0, start_line - 1)
+                end_idx = end_line if end_line is not None else total_lines
+                end_idx = min(end_idx, total_lines)  # Ensure we don't exceed file length
+              
+                # Extract the requested lines
+                content = '\n'.join(lines[start_idx:end_idx])
+          
+            return self.success_response({
+                "content": content,
+                "file_path": file_path,
+                "start_line": start_line,
+                "end_line": end_line if end_line is not None else total_lines,
+                "total_lines": total_lines
+            })
+          
+        except UnicodeDecodeError:
+            return self.fail_response(f"File '{file_path}' appears to be binary and cannot be read as text")
+        except Exception as e:
+            return self.fail_response(f"Error reading file: {str(e)}")

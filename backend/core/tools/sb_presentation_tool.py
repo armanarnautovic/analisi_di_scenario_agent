@@ -17,7 +17,7 @@ class SandboxPresentationTool(SandboxToolsBase):
     
     def __init__(self, project_id: str, thread_manager: ThreadManager):
         super().__init__(project_id, thread_manager)
-        self.workspace_path = "/workspace"
+        # workspace_path is now set by parent class using centralized configuration
         self.presentations_dir = "presentations"
 
     async def _ensure_presentations_dir(self):

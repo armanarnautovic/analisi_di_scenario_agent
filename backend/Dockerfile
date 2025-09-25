@@ -1,28 +1,40 @@
 FROM ghcr.io/astral-sh/uv:python3.11-alpine
 
-ENV ENV_MODE production
+ENV ENV_MODE=production
 WORKDIR /app
 
-RUN apk add --no-cache curl git
+# 🔧 tool base per pip build + bash (facoltativo se usi /bin/sh)
+RUN apk add --no-cache \
+    bash \
+    build-base \
+    libffi-dev \
+    openssl-dev \
+    git \
+    curl \
+    tmux
 
-# Install Python dependencies
+# deps python
 COPY pyproject.toml uv.lock ./
 ENV UV_LINK_MODE=copy
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --quiet
 
-# Copy application code
+# codice app
 COPY . .
 
-# Calculate optimal worker count based on 16 vCPUs
-# Using (2*CPU)+1 formula for CPU-bound applications
+# 🔧 crea la workspace condivisa per LocalProcess
+RUN mkdir -p /workspace && chmod -R 777 /workspace
+
+# (facoltativo, ma consigliato) utente non-root
+# RUN adduser -D -u 1000 appuser && chown -R appuser:appuser /app /workspace
+# USER appuser
+
+# Tuning gunicorn (se questa immagine serve anche al backend API)
 ENV WORKERS=7
 ENV THREADS=2
 ENV WORKER_CONNECTIONS=2000
-
 ENV PYTHONPATH=/app
 EXPOSE 8000
 
-# Gunicorn configuration
 CMD ["sh", "-c", "uv run gunicorn api:app \
   --workers $WORKERS \
   --worker-class uvicorn.workers.UvicornWorker \

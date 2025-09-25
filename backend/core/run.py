@@ -288,6 +288,9 @@ class PromptManager:
         
         default_system_content = get_system_prompt()
         
+        
+        logger.debug(f"prompt: {default_system_content}")
+        
         if "anthropic" not in model_name.lower():
             sample_response_path = os.path.join(os.path.dirname(__file__), 'prompts/samples/1.txt')
             with open(sample_response_path, 'r') as file:
@@ -451,6 +454,9 @@ When using the tools:
         system_content += datetime_info
 
         system_message = {"role": "system", "content": system_content}
+        
+        logger.debug(f"system_content: {system_content}")
+        
         return system_message
 
 
@@ -656,7 +662,10 @@ class AgentRunner:
             latest_message = await self.client.table('messages').select('*').eq('thread_id', self.config.thread_id).in_('type', ['assistant', 'tool', 'user']).order('created_at', desc=True).limit(1).execute()
             if latest_message.data and len(latest_message.data) > 0:
                 message_type = latest_message.data[0].get('type')
-                if message_type == 'assistant':
+                logger.debug(f"Iteration count: {iteration_count}")
+                logger.debug(f"Latest message: {latest_message.data[0]}")
+                logger.debug(f"Latest message content: {latest_message.data[0].get('content')}")
+                if message_type == 'assistant' and iteration_count > 1 and latest_message.data[0].get('content') == "JOB FINISHED YUH!":
                     continue_execution = False
                     break
 
@@ -674,7 +683,7 @@ class AgentRunner:
                     llm_model=self.config.model_name,
                     llm_temperature=0,
                     llm_max_tokens=max_tokens,
-                    tool_choice="auto",
+                    tool_choice="required",
                     max_xml_tool_calls=1,
                     temporary_message=temporary_message,
                     processor_config=ProcessorConfig(
